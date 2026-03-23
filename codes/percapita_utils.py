@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
 
@@ -9,7 +11,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.animation import FuncAnimation
 from matplotlib.cm import ScalarMappable
-from matplotlib.colors import TwoSlopeNorm
+from matplotlib.colors import Normalize, TwoSlopeNorm
 
 
 ISO3_FIX = {
@@ -83,6 +85,42 @@ def _make_world_iso3_key(world: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     world["_iso3"] = world["_iso3"].replace(ISO3_FIX)
     world.loc[invalid, "_iso3"] = np.nan
     return world
+
+
+def load_whitespace_matrix_txt(
+    matrix_path: str,
+    *,
+    zip_member: Optional[str] = None,
+    encoding: str = "utf-8",
+) -> np.ndarray:
+    path = str(matrix_path)
+    member = zip_member
+    zip_path: Optional[str] = None
+
+    if ".zip!" in path.lower():
+        zip_path, member = path.split("!", 1)
+    elif path.lower().endswith(".zip"):
+        zip_path = path
+
+    if zip_path is not None:
+        if not member:
+            raise ValueError(
+                "ZIP内のテキストを読む場合は zip_member を指定してください。"
+                " 例: zip_member='uWFp_item15.txt'"
+            )
+
+        with zipfile.ZipFile(zip_path) as zf:
+            if member not in zf.namelist():
+                raise ValueError(f"ZIP内に member が見つかりません: {member}")
+            with zf.open(member) as raw, io.TextIOWrapper(raw, encoding=encoding) as f:
+                df = pd.read_csv(f, sep=r"\s+", header=None, engine="python")
+    else:
+        df = pd.read_csv(path, sep=r"\s+", header=None, engine="python", encoding=encoding)
+
+    arr = df.to_numpy(dtype=float)
+    if arr.ndim != 2:
+        raise ValueError(f"行列データは2次元である必要があります。shape={arr.shape}")
+    return arr
 
 
 def extract_population_by_iso3_for_year(
@@ -539,6 +577,280 @@ def animate_vwt_net_import_export_percapita(
         print("Saved GIF:", out_gif)
 
     return anim
+
+
+def animate_country_year_matrix_map(
+    matrix_path: str,
+    *,
+    country_list_xlsx: str,
+    ne_countries_shp: str,
+    zip_member: Optional[str] = None,
+    column_start_year: Optional[int] = None,
+    year_start: Optional[int] = None,
+    year_end: Optional[int] = None,
+    last_n_years: Optional[int] = None,
+    aggregation: str = "mean",
+    value_unit: str = "m^3/ton",
+    fps: int = 6,
+    interval_ms: Optional[int] = None,
+    out_mp4: Optional[str] = None,
+    out_gif: Optional[str] = None,
+    dpi: int = 150,
+    cmap: str = "YlGnBu",
+    clip_quantile: Optional[float] = 0.995,
+    missing_color: str = "#BEBEBE",
+    border_color: str = "#444444",
+    border_lw: float = 0.35,
+    show_missing_legend: bool = True,
+    xlim=(-180, 180),
+    ylim=(-60, 85),
+    ussr_until_year: int = 1991,
+) -> FuncAnimation:
+    if aggregation not in {"mean", "sum"}:
+        raise ValueError("aggregation は 'mean' か 'sum' を指定してください。")
+
+    if last_n_years is not None and (year_start is not None or year_end is not None):
+        raise ValueError("last_n_years と year_start/year_end は同時に指定できません。")
+
+    if interval_ms is None:
+        interval_ms = int(1000 / max(1, int(fps)))
+
+    matrix = load_whitespace_matrix_txt(matrix_path, zip_member=zip_member)
+    n_country, n_col = matrix.shape
+    if n_country <= 0 or n_col <= 0:
+        raise ValueError(f"行列が空です。shape={matrix.shape}")
+
+    if column_start_year is not None:
+        all_years = list(range(int(column_start_year), int(column_start_year) + n_col))
+    else:
+        all_years = list(range(1, n_col + 1))
+
+    if year_start is not None or year_end is not None:
+        ys = int(year_start) if year_start is not None else min(all_years)
+        ye = int(year_end) if year_end is not None else max(all_years)
+        if ys > ye:
+            raise ValueError(f"year_start <= year_end になるように指定してください。got {ys}>{ye}")
+        selected_idx = [i for i, y in enumerate(all_years) if ys <= int(y) <= ye]
+    elif last_n_years is not None:
+        n_take = int(last_n_years)
+        if n_take <= 0:
+            raise ValueError("last_n_years は 1 以上を指定してください。")
+        start_i = max(0, n_col - n_take)
+        selected_idx = list(range(start_i, n_col))
+    else:
+        selected_idx = list(range(n_col))
+
+    if len(selected_idx) == 0:
+        raise ValueError("指定条件で可視化対象の年（列）が 0 件になりました。")
+
+    years = [all_years[i] for i in selected_idx]
+    print(
+        f"Matrix shape={matrix.shape}, selected columns={len(selected_idx)} "
+        f"({years[0]}..{years[-1]})"
+    )
+
+    cl = pd.read_excel(country_list_xlsx)
+    iso3_col = _find_column(cl.columns, exact=["iso3", "iso_a3", "iso-3", "iso_3"], contains=["iso3"])
+    if iso3_col is None:
+        raise ValueError(f"country_list に ISO3 列が見つからない。columns={list(cl.columns)}")
+    if len(cl) < n_country:
+        raise ValueError(
+            f"country_list rows ({len(cl)}) < matrix rows ({n_country}). "
+            "country_listの行数が足りない。"
+        )
+
+    cl_n = cl.iloc[:n_country].copy()
+    cl_n["_iso3_raw"] = cl_n[iso3_col].astype(str)
+    cl_n["_iso3"] = _clean_iso3(cl_n["_iso3_raw"]).replace(ISO3_FIX)
+
+    country_name_col = _find_column(cl_n.columns, exact=["country name", "country", "name"], contains=["country"])
+    if country_name_col is None:
+        country_name_col = cl_n.columns[0]
+    cl_n["_country_upper"] = cl_n[country_name_col].astype(str).str.strip().str.upper()
+    missing_iso = cl_n["_iso3"].isna()
+    cl_n.loc[missing_iso & cl_n["_country_upper"].isin(USSR_NAME_ALIASES), "_iso3"] = "USSR"
+
+    ne_countries_shp = _normalize_zip_shp_path(ne_countries_shp)
+    world = gpd.read_file(ne_countries_shp)
+    world = _make_world_iso3_key(world)
+
+    values_by_year: dict[int, pd.DataFrame] = {}
+    all_vals = []
+    for col_i, y in zip(selected_idx, years):
+        df_y = pd.DataFrame(
+            {
+                "iso3_raw": cl_n["_iso3"].values,
+                "value": matrix[:, col_i].astype(float),
+            }
+        )
+        if int(y) <= int(ussr_until_year):
+            df_y["iso3"] = df_y["iso3_raw"].replace({k: "RUS" for k in USSR_ALIASES})
+        else:
+            df_y["iso3"] = df_y["iso3_raw"]
+
+        df_y = df_y[df_y["iso3"].notna()].copy()
+        df_y = df_y.groupby("iso3", as_index=False)["value"].agg(aggregation)
+        values_by_year[int(y)] = df_y
+
+        vv = df_y["value"].to_numpy(dtype=float)
+        vv = vv[np.isfinite(vv)]
+        if vv.size > 0:
+            all_vals.append(vv)
+
+    if len(all_vals) == 0:
+        raise ValueError("全年で value の有効値が1つもありません。")
+
+    vals = np.concatenate(all_vals)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        raise ValueError("value の有効値がありません。")
+
+    signed = (np.nanmin(vals) < 0) and (np.nanmax(vals) > 0)
+    if signed:
+        absvals = np.abs(vals)
+        if clip_quantile is not None:
+            q = float(clip_quantile)
+            if not (0 < q <= 1):
+                raise ValueError("clip_quantile must be in (0, 1].")
+            vmax = float(np.nanquantile(absvals, q))
+            if not np.isfinite(vmax) or vmax <= 0:
+                vmax = float(np.nanmax(absvals))
+        else:
+            vmax = float(np.nanmax(absvals))
+        if not np.isfinite(vmax) or vmax <= 0:
+            vmax = 1.0
+        norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+        print(f"Global signed scale: [-{vmax:g}, +{vmax:g}]")
+    else:
+        if clip_quantile is not None:
+            q = float(clip_quantile)
+            if not (0 < q <= 1):
+                raise ValueError("clip_quantile must be in (0, 1].")
+            vmax = float(np.nanquantile(vals, q))
+            if not np.isfinite(vmax):
+                vmax = float(np.nanmax(vals))
+        else:
+            vmax = float(np.nanmax(vals))
+        vmin = min(0.0, float(np.nanmin(vals)))
+        if not np.isfinite(vmax) or vmax <= vmin:
+            vmax = vmin + 1.0
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        print(f"Global scale: [{vmin:g}, {vmax:g}]")
+
+    dataset_label = zip_member if zip_member else Path(str(matrix_path).split("!")[0]).name
+
+    fig, ax = plt.subplots(1, 1, figsize=(14, 7))
+    ax.set_axis_off()
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label(f"value [{value_unit}]")
+
+    def update(frame_i: int):
+        y = int(years[frame_i])
+        ax.cla()
+        ax.set_axis_off()
+        ax.set_title(f"{dataset_label} [{value_unit}] | {y}", fontsize=14)
+
+        m = world.merge(values_by_year[y], left_on="_iso3", right_on="iso3", how="left")
+        m.plot(ax=ax, color=missing_color, linewidth=0.0, edgecolor="none", zorder=1)
+
+        has = np.isfinite(m["value"].astype(float))
+        if has.any():
+            m.loc[has].plot(
+                ax=ax,
+                column="value",
+                cmap=cmap,
+                norm=norm,
+                linewidth=0.0,
+                edgecolor="none",
+                legend=False,
+                zorder=2,
+            )
+
+        m.boundary.plot(ax=ax, color=border_color, linewidth=border_lw, zorder=3)
+
+        if show_missing_legend:
+            from matplotlib.patches import Patch
+
+            ax.legend(
+                handles=[Patch(facecolor=missing_color, edgecolor="none", label="No data / no match")],
+                loc="lower left",
+                frameon=True,
+            )
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        return []
+
+    anim = FuncAnimation(fig, update, frames=len(years), interval=interval_ms, blit=False)
+
+    if out_mp4:
+        anim.save(out_mp4, writer="ffmpeg", fps=fps, dpi=dpi)
+        print("Saved MP4:", out_mp4)
+
+    if out_gif:
+        anim.save(out_gif, writer="pillow", fps=fps, dpi=dpi)
+        print("Saved GIF:", out_gif)
+
+    return anim
+
+
+def animate_uwfp_item_map(
+    *,
+    item_id: int,
+    uwfp_zip_path: str,
+    country_list_xlsx: str,
+    ne_countries_shp: str,
+    column_start_year: int = 1961,
+    year_start: Optional[int] = None,
+    year_end: Optional[int] = None,
+    last_n_years: Optional[int] = None,
+    aggregation: str = "mean",
+    value_unit: str = "m^3/ton",
+    fps: int = 6,
+    interval_ms: Optional[int] = None,
+    out_mp4: Optional[str] = None,
+    out_gif: Optional[str] = None,
+    dpi: int = 150,
+    cmap: str = "YlGnBu",
+    clip_quantile: Optional[float] = 0.995,
+    missing_color: str = "#BEBEBE",
+    border_color: str = "#444444",
+    border_lw: float = 0.35,
+    show_missing_legend: bool = True,
+    xlim=(-180, 180),
+    ylim=(-60, 85),
+    ussr_until_year: int = 1991,
+) -> FuncAnimation:
+    member = f"uWFp_item{int(item_id)}.txt"
+    return animate_country_year_matrix_map(
+        matrix_path=uwfp_zip_path,
+        zip_member=member,
+        country_list_xlsx=country_list_xlsx,
+        ne_countries_shp=ne_countries_shp,
+        column_start_year=column_start_year,
+        year_start=year_start,
+        year_end=year_end,
+        last_n_years=last_n_years,
+        aggregation=aggregation,
+        value_unit=value_unit,
+        fps=fps,
+        interval_ms=interval_ms,
+        out_mp4=out_mp4,
+        out_gif=out_gif,
+        dpi=dpi,
+        cmap=cmap,
+        clip_quantile=clip_quantile,
+        missing_color=missing_color,
+        border_color=border_color,
+        border_lw=border_lw,
+        show_missing_legend=show_missing_legend,
+        xlim=xlim,
+        ylim=ylim,
+        ussr_until_year=ussr_until_year,
+    )
 
 
 def save_vwt_net_and_percapita_npy_by_year(
