@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 import zipfile
 from pathlib import Path
 from typing import Any, Iterable, Optional, Tuple
@@ -1214,3 +1215,497 @@ def get_vwt_trade_record(
         "net_pc": float(store["net_pc"][ci, yi, ii]),
         "population_used": float(store["population_used"][ci, yi, ii]),
     }
+
+
+def _find_wb_header_row(raw: pd.DataFrame) -> int:
+    for i in range(min(len(raw), 20)):
+        vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
+        if ("country name" in vals) and ("country code" in vals):
+            return int(i)
+    raise ValueError("World Bank 形式のヘッダ行（Country Name / Country Code）を検出できません。")
+
+
+def _detect_year_column_map(columns) -> dict[str, Any]:
+    year_map: dict[str, Any] = {}
+    for c in columns:
+        y: Optional[str] = None
+
+        if isinstance(c, (int, np.integer)):
+            yi = int(c)
+            if 1800 <= yi <= 2100:
+                y = str(yi)
+        elif isinstance(c, (float, np.floating)):
+            if np.isfinite(c) and float(c).is_integer():
+                yi = int(c)
+                if 1800 <= yi <= 2100:
+                    y = str(yi)
+        else:
+            s = str(c).strip()
+            m = re.fullmatch(r"(\d{4})(?:\.0+)?", s)
+            if m is not None:
+                yi = int(m.group(1))
+                if 1800 <= yi <= 2100:
+                    y = str(yi)
+
+        if y is not None and y not in year_map:
+            year_map[y] = c
+
+    year_map = dict(sorted(year_map.items(), key=lambda kv: int(kv[0])))
+    return year_map
+
+
+def load_world_bank_excel_wide_by_iso3(
+    excel_path: str,
+    *,
+    sheet_name: int | str = 0,
+) -> pd.DataFrame:
+    raw = pd.read_excel(excel_path, sheet_name=sheet_name, header=None)
+    header_row = _find_wb_header_row(raw)
+
+    header = raw.iloc[header_row].tolist()
+    df = raw.iloc[header_row + 1 :].copy()
+    df.columns = header
+
+    code_col = _find_column(
+        df.columns,
+        exact=["Country Code", "country code", "ISO3", "iso3"],
+        contains=["country code", "iso3"],
+    )
+    if code_col is None:
+        raise ValueError(f"Country Code列を特定できません。columns={list(df.columns)}")
+
+    year_map = _detect_year_column_map(df.columns)
+    if len(year_map) == 0:
+        raise ValueError("年列（例: 1986, 2015）が見つかりません。")
+
+    year_keys = list(year_map.keys())
+    year_cols = [year_map[y] for y in year_keys]
+
+    out = df[[code_col] + year_cols].copy()
+    rename_dict = {code_col: "iso3"}
+    rename_dict.update({year_map[y]: y for y in year_keys})
+    out = out.rename(columns=rename_dict)
+    out["iso3"] = _clean_iso3(out["iso3"]).replace(ISO3_FIX)
+
+    for y in year_keys:
+        out[y] = pd.to_numeric(out[y], errors="coerce")
+
+    out = out[out["iso3"].notna()].copy()
+    out = out.groupby("iso3", as_index=False)[year_keys].mean(numeric_only=True)
+    return out
+
+
+def load_world_bank_csv_wide_by_iso3(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+
+    code_col = _find_column(
+        df.columns,
+        exact=["Country Code", "country code", "ISO3", "iso3"],
+        contains=["country code", "iso3"],
+    )
+    if code_col is None:
+        raise ValueError(f"Country Code列を特定できません。columns={list(df.columns)}")
+
+    year_map = _detect_year_column_map(df.columns)
+    if len(year_map) > 0:
+        # wide形式（列が 1960, 1961, ...）
+        year_keys = list(year_map.keys())
+        year_cols = [year_map[y] for y in year_keys]
+        out = df[[code_col] + year_cols].copy()
+        rename_dict = {code_col: "iso3"}
+        rename_dict.update({year_map[y]: y for y in year_keys})
+        out = out.rename(columns=rename_dict)
+        out["iso3"] = _clean_iso3(out["iso3"]).replace(ISO3_FIX)
+
+        for y in year_keys:
+            out[y] = pd.to_numeric(out[y], errors="coerce")
+
+        out = out[out["iso3"].notna()].copy()
+        out = out.groupby("iso3", as_index=False)[year_keys].mean(numeric_only=True)
+        return out
+
+    # long形式（Country Code, Year, Value）
+    year_col = _find_column(df.columns, exact=["Year", "year", "YR", "yr"], contains=["year"])
+    value_col = _find_column(
+        df.columns,
+        exact=["Value", "value", "Population", "population", "Pop", "pop"],
+        contains=["value", "population", "pop"],
+    )
+    if year_col is None or value_col is None:
+        raise ValueError(
+            "年列（wide）も Year/Value（long）も検出できません。"
+            f" columns={list(df.columns)}"
+        )
+
+    long_df = df[[code_col, year_col, value_col]].copy()
+    long_df.columns = ["iso3", "year", "value"]
+    long_df["iso3"] = _clean_iso3(long_df["iso3"]).replace(ISO3_FIX)
+    long_df["year"] = pd.to_numeric(long_df["year"], errors="coerce")
+    long_df["value"] = pd.to_numeric(long_df["value"], errors="coerce")
+    long_df = long_df[
+        long_df["iso3"].notna() & np.isfinite(long_df["year"]) & np.isfinite(long_df["value"])
+    ].copy()
+
+    if len(long_df) == 0:
+        raise ValueError("long形式を検出しましたが有効データがありません。")
+
+    long_df["year"] = long_df["year"].astype(int)
+    out = (
+        long_df.pivot_table(index="iso3", columns="year", values="value", aggfunc="mean")
+        .reset_index()
+        .rename_axis(None, axis=1)
+    )
+    out.columns = [str(int(c)) if isinstance(c, (int, np.integer)) else str(c) for c in out.columns]
+    return out
+
+
+def _extract_year_series_from_wide(
+    wide_df: pd.DataFrame,
+    year: int,
+    *,
+    value_name: str,
+) -> pd.DataFrame:
+    ycol = str(int(year))
+    if ycol not in wide_df.columns:
+        return pd.DataFrame({"iso3": wide_df["iso3"], value_name: np.nan})
+
+    out = wide_df[["iso3", ycol]].copy()
+    out = out.rename(columns={ycol: value_name})
+    out[value_name] = pd.to_numeric(out[value_name], errors="coerce")
+    out = out.groupby("iso3", as_index=False)[value_name].mean()
+    return out
+
+
+def _load_item_catalog(item_list_xlsx: str) -> dict[int, str]:
+    df = pd.read_excel(item_list_xlsx)
+    if df.shape[1] < 2:
+        return {}
+
+    ids = pd.to_numeric(df.iloc[:, 1], errors="coerce")
+    names = df.iloc[:, 0].astype(str).str.strip()
+    cat = pd.DataFrame({"crop_id": ids, "crop_name": names}).dropna(subset=["crop_id"])
+    cat["crop_id"] = cat["crop_id"].astype(int)
+    cat["crop_name"] = cat["crop_name"].replace({"": np.nan}).fillna(cat["crop_id"].map(lambda x: f"item_{x}"))
+    return dict(cat.drop_duplicates("crop_id")[["crop_id", "crop_name"]].values.tolist())
+
+
+def list_available_vwt_item_years(vwt_npy_dir: str) -> pd.DataFrame:
+    pat = re.compile(r"^VWT_(\d+)_(\d+)\.npy$")
+    rows = []
+    for p in Path(vwt_npy_dir).glob("VWT_*_*.npy"):
+        m = pat.match(p.name)
+        if not m:
+            continue
+        rows.append({"crop_id": int(m.group(1)), "year": int(m.group(2)), "vwt_npy_path": str(p)})
+
+    if len(rows) == 0:
+        raise ValueError(f"VWT npy ファイルが見つかりません: {vwt_npy_dir}")
+
+    out = pd.DataFrame(rows).sort_values(["crop_id", "year"]).reset_index(drop=True)
+    return out
+
+
+def build_gdp_importpc_scatter_dataset(
+    *,
+    vwt_npy_dir: str,
+    country_list_xlsx: str,
+    population_csv: str,
+    gdp_per_capita_xls: str,
+    item_list_xlsx: Optional[str] = None,
+    crops: Optional[Iterable[int]] = None,
+    years: Optional[Iterable[int]] = None,
+    year_start: Optional[int] = None,
+    year_end: Optional[int] = None,
+    ussr_until_year: int = 1991,
+) -> pd.DataFrame:
+    available = list_available_vwt_item_years(vwt_npy_dir)
+
+    if crops is not None:
+        crop_set = {int(c) for c in crops}
+        available = available[available["crop_id"].isin(crop_set)].copy()
+
+    if years is not None:
+        year_set = {int(y) for y in years}
+        available = available[available["year"].isin(year_set)].copy()
+    else:
+        if year_start is not None:
+            available = available[available["year"] >= int(year_start)].copy()
+        if year_end is not None:
+            available = available[available["year"] <= int(year_end)].copy()
+
+    if len(available) == 0:
+        raise ValueError("条件に一致する VWT データ（作物・年）がありません。")
+
+    cl = pd.read_excel(country_list_xlsx)
+    iso3_col = _find_column(cl.columns, exact=["iso3", "iso_a3", "iso-3", "iso_3"], contains=["iso3"])
+    if iso3_col is None:
+        raise ValueError(f"country_list に ISO3 列が見つからない。columns={list(cl.columns)}")
+
+    country_name_col = _find_column(cl.columns, exact=["country name", "country", "name"], contains=["country"])
+    if country_name_col is None:
+        country_name_col = cl.columns[0]
+
+    item_name_map = _load_item_catalog(item_list_xlsx) if item_list_xlsx else {}
+    pop_wide = load_world_bank_csv_wide_by_iso3(population_csv)
+    gdp_wide = load_world_bank_excel_wide_by_iso3(gdp_per_capita_xls, sheet_name=0)
+
+    pop_cache: dict[int, pd.DataFrame] = {}
+    gdp_cache: dict[int, pd.DataFrame] = {}
+    rows = []
+
+    for r in available.itertuples(index=False):
+        crop = int(r.crop_id)
+        year = int(r.year)
+        vwt_path = str(r.vwt_npy_path)
+
+        vwt = np.load(vwt_path).astype(float)
+        if vwt.ndim != 2:
+            raise ValueError(f"VWTmat must be 2D. crop={crop}, year={year}, shape={vwt.shape}")
+
+        n = min(vwt.shape[0], vwt.shape[1])
+        if len(cl) < n:
+            raise ValueError(f"country_list rows ({len(cl)}) < VWT size ({n}). country_listの行数が足りない。")
+
+        cl_n = cl.iloc[:n].copy()
+        cl_n["_iso3"] = _clean_iso3(cl_n[iso3_col]).replace(ISO3_FIX)
+        cl_n["_country_upper"] = cl_n[country_name_col].astype(str).str.strip().str.upper()
+        missing_iso = cl_n["_iso3"].isna()
+        cl_n.loc[missing_iso & cl_n["_country_upper"].isin(USSR_NAME_ALIASES), "_iso3"] = "USSR"
+
+        import_total = np.nansum(vwt[:n, :n], axis=0)
+        trade = pd.DataFrame({"iso3_raw": cl_n["_iso3"].values, "import_total": import_total})
+        if year <= int(ussr_until_year):
+            trade["iso3"] = trade["iso3_raw"].replace({k: "RUS" for k in USSR_ALIASES})
+        else:
+            trade["iso3"] = trade["iso3_raw"]
+
+        trade = trade[trade["iso3"].notna()].copy()
+        trade = trade.groupby("iso3", as_index=False)["import_total"].sum()
+
+        if year not in pop_cache:
+            pop_cache[year] = _extract_year_series_from_wide(pop_wide, year, value_name="population")
+        if year not in gdp_cache:
+            gdp_cache[year] = _extract_year_series_from_wide(gdp_wide, year, value_name="gdp_pc")
+
+        merged = trade.merge(pop_cache[year], on="iso3", how="left")
+        merged = merged.merge(gdp_cache[year], on="iso3", how="left")
+
+        valid_pop = np.isfinite(merged["population"]) & (merged["population"] > 0)
+        merged["import_pc"] = np.where(valid_pop, merged["import_total"] / merged["population"], np.nan)
+
+        merged["crop_id"] = crop
+        merged["crop_name"] = item_name_map.get(crop, f"item_{crop}")
+        merged["year"] = year
+        merged["vwt_npy_path"] = vwt_path
+
+        merged = merged[
+            np.isfinite(merged["import_pc"]) & np.isfinite(merged["gdp_pc"]) & (merged["gdp_pc"] > 0)
+        ].copy()
+
+        rows.append(
+            merged[
+                [
+                    "crop_id",
+                    "crop_name",
+                    "year",
+                    "iso3",
+                    "gdp_pc",
+                    "population",
+                    "import_total",
+                    "import_pc",
+                    "vwt_npy_path",
+                ]
+            ]
+        )
+
+    if len(rows) == 0:
+        raise ValueError("有効な散布図データが作れませんでした（GDP/人口/輸入量の結合結果を確認）。")
+
+    out = pd.concat(rows, ignore_index=True)
+    out = out.sort_values(["crop_id", "year", "iso3"]).reset_index(drop=True)
+    return out
+
+
+def _scale_bubble_sizes(
+    pop: pd.Series,
+    *,
+    marker_size_min: float = 20.0,
+    marker_size_max: float = 1200.0,
+) -> np.ndarray:
+    p = pd.to_numeric(pop, errors="coerce").to_numpy(dtype=float)
+    s = np.full_like(p, fill_value=marker_size_min, dtype=float)
+    valid = np.isfinite(p) & (p > 0)
+    if valid.sum() == 0:
+        return s
+
+    root = np.sqrt(p[valid])
+    lo = float(np.nanmin(root))
+    hi = float(np.nanmax(root))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        s[valid] = (marker_size_min + marker_size_max) / 2.0
+        return s
+
+    s[valid] = marker_size_min + (root - lo) / (hi - lo) * (marker_size_max - marker_size_min)
+    return s
+
+
+def plot_gdp_importpc_bubbles_by_crop(
+    scatter_df: pd.DataFrame,
+    *,
+    output_dir: Optional[str] = None,
+    show_figures: bool = False,
+    ncols: int = 4,
+    fig_w_per_ax: float = 4.8,
+    fig_h_per_ax: float = 3.9,
+    marker_size_min: float = 20.0,
+    marker_size_max: float = 1200.0,
+    log_x: bool = True,
+    annotate_top_n_population: int = 0,
+) -> pd.DataFrame:
+    required = {"crop_id", "crop_name", "year", "iso3", "gdp_pc", "population", "import_pc"}
+    miss = required - set(scatter_df.columns)
+    if miss:
+        raise ValueError(f"scatter_df に必要列が足りません: {sorted(miss)}")
+
+    save_dir = Path(output_dir) if output_dir else None
+    if save_dir is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows = []
+    grouped = scatter_df.groupby(["crop_id", "crop_name"], sort=True)
+
+    for (crop_id, crop_name), g_crop in grouped:
+        years = sorted(g_crop["year"].dropna().astype(int).unique().tolist())
+        if len(years) == 0:
+            continue
+
+        n = len(years)
+        ncols_eff = max(1, int(ncols))
+        nrows = int(np.ceil(n / ncols_eff))
+
+        fig, axes = plt.subplots(
+            nrows=nrows,
+            ncols=ncols_eff,
+            figsize=(fig_w_per_ax * ncols_eff, fig_h_per_ax * nrows),
+            squeeze=False,
+        )
+        axes_flat = axes.flatten()
+
+        for i, y in enumerate(years):
+            ax = axes_flat[i]
+            d = g_crop[g_crop["year"] == y].copy()
+            d = d[np.isfinite(d["gdp_pc"]) & np.isfinite(d["import_pc"]) & np.isfinite(d["population"])].copy()
+            d = d[(d["gdp_pc"] > 0) & (d["population"] > 0)].copy()
+
+            if len(d) == 0:
+                ax.set_axis_off()
+                continue
+
+            sizes = _scale_bubble_sizes(
+                d["population"],
+                marker_size_min=marker_size_min,
+                marker_size_max=marker_size_max,
+            )
+            ax.scatter(
+                d["gdp_pc"],
+                d["import_pc"],
+                s=sizes,
+                alpha=0.45,
+                c="#2A9D8F",
+                edgecolors="#1B4332",
+                linewidths=0.4,
+            )
+
+            if log_x:
+                ax.set_xscale("log")
+
+            if int(annotate_top_n_population) > 0:
+                top = d.nlargest(int(annotate_top_n_population), "population")
+                for rr in top.itertuples(index=False):
+                    ax.annotate(
+                        str(rr.iso3),
+                        (float(rr.gdp_pc), float(rr.import_pc)),
+                        fontsize=7,
+                        alpha=0.85,
+                    )
+
+            ax.set_title(str(y), fontsize=10)
+            ax.set_xlabel("GDP per capita (current US$)")
+            ax.set_ylabel("Virtual water import per capita (m^3/person/year)")
+            ax.grid(True, alpha=0.25)
+
+        for j in range(n, len(axes_flat)):
+            axes_flat[j].set_axis_off()
+
+        fig.suptitle(
+            f"Crop {int(crop_id)}: {crop_name}\n"
+            "X = GDP per capita, Y = Virtual water import per capita, bubble size = population",
+            fontsize=12,
+        )
+        fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.95])
+
+        out_png = None
+        if save_dir is not None:
+            safe_name = str(crop_name).replace("/", "_").replace("\\", "_").replace(" ", "_")
+            out_png = save_dir / f"bubble_gdp_importpc_crop{int(crop_id)}_{safe_name}.png"
+            fig.savefig(out_png, dpi=170, bbox_inches="tight")
+
+        if show_figures:
+            plt.show()
+        plt.close(fig)
+
+        summary_rows.append(
+            {
+                "crop_id": int(crop_id),
+                "crop_name": str(crop_name),
+                "n_years": int(len(years)),
+                "year_min": int(min(years)),
+                "year_max": int(max(years)),
+                "n_points_total": int(len(g_crop)),
+                "out_png": str(out_png) if out_png is not None else "",
+            }
+        )
+
+    return pd.DataFrame(summary_rows)
+
+
+def run_gdp_importpc_bubble_pipeline(
+    *,
+    vwt_npy_dir: str,
+    country_list_xlsx: str,
+    population_csv: str,
+    gdp_per_capita_xls: str,
+    item_list_xlsx: Optional[str] = None,
+    crops: Optional[Iterable[int]] = None,
+    years: Optional[Iterable[int]] = None,
+    year_start: Optional[int] = None,
+    year_end: Optional[int] = None,
+    output_dir: Optional[str] = None,
+    show_figures: bool = False,
+    ncols: int = 4,
+    log_x: bool = True,
+    annotate_top_n_population: int = 0,
+    ussr_until_year: int = 1991,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    scatter_df = build_gdp_importpc_scatter_dataset(
+        vwt_npy_dir=vwt_npy_dir,
+        country_list_xlsx=country_list_xlsx,
+        population_csv=population_csv,
+        gdp_per_capita_xls=gdp_per_capita_xls,
+        item_list_xlsx=item_list_xlsx,
+        crops=crops,
+        years=years,
+        year_start=year_start,
+        year_end=year_end,
+        ussr_until_year=ussr_until_year,
+    )
+
+    summary = plot_gdp_importpc_bubbles_by_crop(
+        scatter_df,
+        output_dir=output_dir,
+        show_figures=show_figures,
+        ncols=ncols,
+        log_x=log_x,
+        annotate_top_n_population=annotate_top_n_population,
+    )
+    return scatter_df, summary
